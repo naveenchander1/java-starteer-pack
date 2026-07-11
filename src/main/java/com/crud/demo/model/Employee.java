@@ -6,7 +6,7 @@ import jakarta.validation.constraints.Positive;
 public class Employee {
 
     @Positive(message = "Id must be greater than 0")
-    private int id;
+    private Long id;
 
     @NotBlank(message = "Name is required")
     private String name;
@@ -21,18 +21,18 @@ public class Employee {
         // Required for Spring/Jackson
     }
 
-    public Employee(int id, String name, String department, String salary) {
+    public Employee(Long id, String name, String department, String salary) {
         this.id = id;
         this.name = name;
         this.department = department;
         this.salary = salary;
     }
 
-    public int getId() {
+    public Long getId() {
         return id;
     }
 
-    public void setId(int id) {
+    public void setId(Long id) {
         this.id = id;
     }
 

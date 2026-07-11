@@ -13,17 +13,17 @@ public class EmployeeService {
     final List<Employee> employees = new ArrayList<>();
 
     public EmployeeService(){
-        this.employees.add(new Employee(1, "Naveen", "Developer", "12"));
-        this.employees.add(new Employee(2, "Naveen2", "Developer", "24"));
+        this.employees.add(new Employee(1L, "Naveen", "Developer", "12"));
+        this.employees.add(new Employee(2L, "Naveen2", "Developer", "24"));
     }
 
     public List<Employee> getAllEmployees(){
       return this.employees;
     };
 
-    public Employee getEmployee(int id){
+    public Employee getEmployee(Long id){
         for (Employee employee : employees) {
-            if(employee.getId() == id){
+            if(employee.getId().equals(id)){
                 return employee;
             }
         }
@@ -35,9 +35,9 @@ public class EmployeeService {
         return this.employees;
     }
 
-    public Employee updateEmployee(Employee updatedEmployee, int id) {
+    public Employee updateEmployee(Employee updatedEmployee, Long id) {
         for (Employee employee : employees) {
-            if (employee.getId() == id) {
+            if (employee.getId().equals(id)) {
                 employee.setName(updatedEmployee.getName());
                 employee.setDepartment(updatedEmployee.getDepartment());
                 // Update any other fields you have
@@ -49,8 +49,8 @@ public class EmployeeService {
         return null; // or throw an exception
     }
 
-    public boolean deleteEmployee(int id){
-        return employees.removeIf(employee -> employee.getId() == id);
+    public boolean deleteEmployee(Long id){
+        return employees.removeIf(employee -> employee.getId().equals(id));
     }
 
     public List<Employee> searchEmployees (String department) {
