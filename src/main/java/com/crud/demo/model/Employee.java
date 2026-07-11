@@ -3,6 +3,8 @@ package com.crud.demo.model;
 import jakarta.validation.constraints.NotBlank;
 import jakarta.validation.constraints.Positive;
 
+import java.math.BigDecimal;
+
 public class Employee {
 
     @Positive(message = "Id must be greater than 0")
@@ -15,13 +17,13 @@ public class Employee {
     private String department;
 
     @NotBlank(message = "Salary is required")
-    private String salary;
+    private BigDecimal salary;
 
     public Employee() {
         // Required for Spring/Jackson
     }
 
-    public Employee(Long id, String name, String department, String salary) {
+    public Employee(Long id, String name, String department, BigDecimal salary) {
         this.id = id;
         this.name = name;
         this.department = department;
@@ -52,11 +54,11 @@ public class Employee {
         this.department = department;
     }
 
-    public String getSalary() {
+    public BigDecimal getSalary() {
         return salary;
     }
 
-    public void setSalary(String salary) {
+    public void setSalary(BigDecimal salary) {
         this.salary = salary;
     }
 }
