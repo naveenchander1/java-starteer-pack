@@ -1,9 +1,8 @@
 package com.crud.demo.service;
 
+import com.crud.demo.exception.EmployeeNotFoundException;
 import com.crud.demo.model.Employee;
-import org.springframework.http.HttpStatus;
 import org.springframework.stereotype.Service;
-import org.springframework.web.server.ResponseStatusException;
 
 import java.math.BigDecimal;
 import java.util.ArrayList;
@@ -28,7 +27,7 @@ public class EmployeeService {
                 return employee;
             }
         }
-        throw new ResponseStatusException(HttpStatus.NOT_FOUND, "Employee not found");
+        throw new EmployeeNotFoundException("Employee not found with id: " + id);
     }
 
     public List<Employee> addEmployee(Employee employee) {
@@ -47,7 +46,7 @@ public class EmployeeService {
             }
         }
 
-        return null; // or throw an exception
+        throw new EmployeeNotFoundException("Employee not found with id: " + id);
     }
 
     public boolean deleteEmployee(Long id){
