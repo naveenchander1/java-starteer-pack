@@ -1,48 +1,71 @@
 package com.crud.demo.controller;
 
-import com.crud.demo.model.Employee;
+import com.crud.demo.dto.EmployeeRequest;
+import com.crud.demo.dto.EmployeeResponse;
+import com.crud.demo.entity.Employee;
 import com.crud.demo.service.EmployeeService;
 import jakarta.validation.Valid;
+import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
 
+import java.net.URI;
 import java.util.List;
+import java.util.stream.Collectors;
 
 @RestController
+@RequestMapping("/employees")
 public class EmployeeController {
+
     private final EmployeeService employeeService;
 
     public EmployeeController(EmployeeService employeeService) {
         this.employeeService = employeeService;
     }
 
-    @GetMapping("/employees")
-    public List<Employee> getAllEmployees() {
-        return employeeService.getAllEmployees();
+    @GetMapping
+    public List<EmployeeResponse> getAllEmployees() {
+        return employeeService.getAllEmployees().stream()
+                .map(EmployeeResponse::from)
+                .collect(Collectors.toList());
     }
 
-    @GetMapping("/employees/{id}")
-    public Employee getEmployee(@PathVariable Long id) {
-        return employeeService.getEmployee(id);
+    @GetMapping("/{id}")
+    public EmployeeResponse getEmployee(@PathVariable Long id) {
+        return EmployeeResponse.from(employeeService.getEmployee(id));
     }
 
-    @PostMapping("/employees")
-    public List<Employee> postEmployee (@Valid @RequestBody Employee employee) {
-        return employeeService.addEmployee(employee);
-    };
+    @PostMapping
+    public ResponseEntity<EmployeeResponse> postEmployee(@Valid @RequestBody EmployeeRequest request) {
+        Employee saved = employeeService.addEmployee(toEntity(request));
+        return ResponseEntity
+                .created(URI.create("/employees/" + saved.getId()))
+                .body(EmployeeResponse.from(saved));
+    }
 
-    @PutMapping("/employees/{id}")
-    public Employee updateEmployee(@RequestBody Employee employee, @PathVariable Long id) {
-        return employeeService.updateEmployee(employee, id);
-    };
+    @PutMapping("/{id}")
+    public EmployeeResponse updateEmployee(@Valid @RequestBody EmployeeRequest request, @PathVariable Long id) {
+        Employee updated = employeeService.updateEmployee(toEntity(request), id);
+        return EmployeeResponse.from(updated);
+    }
 
-    @DeleteMapping("/employeee/{id}")
-    public boolean deleteEmployee(@PathVariable Long id) {
-        return employeeService.deleteEmployee(id);
-    };
+    @DeleteMapping("/{id}")
+    public ResponseEntity<Void> deleteEmployee(@PathVariable Long id) {
+        employeeService.deleteEmployee(id);
+        return ResponseEntity.noContent().build();
+    }
 
-    @GetMapping("/employees/search")
-    public List<Employee> searchEmployees (@RequestParam String department ) {
-        return employeeService.searchEmployees(department);
-    };
+    @GetMapping("/search")
+    public List<EmployeeResponse> searchEmployees(@RequestParam String department) {
+        return employeeService.searchEmployees(department).stream()
+                .map(EmployeeResponse::from)
+                .collect(Collectors.toList());
+    }
 
+    private Employee toEntity(EmployeeRequest request) {
+        Employee employee = new Employee();
+        employee.setName(request.getName());
+        employee.setDepartment(request.getDepartment());
+        employee.setSalary(request.getSalary());
+        return employee;
+    }
 }

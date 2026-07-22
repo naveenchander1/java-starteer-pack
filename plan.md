@@ -1,126 +1,627 @@
-# Plan: Production-grade error handling hardening
+# Plan: Move Employee storage from in-memory `ArrayList` to MySQL
 
 ## Context
 
-Testing `GET /employeesd` (a typo/unmapped route) exposed two gaps between what we have and what's safe to ship:
+Right now `EmployeeService` (`src/main/java/com/crud/demo/service/EmployeeService.java`) holds employees in a plain `ArrayList` seeded in its constructor. Everything resets on restart, "search" is a manual loop, and there's no schema, no migrations, no separation between what the database stores and what the API returns.
 
-1. **Stack traces are leaking to the client.** Any request that isn't caught by our `GlobalExceptionHandler` (e.g. `NoResourceFoundException` for an unmapped URL) falls through to Spring Boot's own default error handler, which returned a JSON body containing a full `trace` field — internal file paths, library versions, class names. That's real reconnaissance information for anyone probing the API and must never reach a client in production.
-2. **Not every exception is centralized yet.** `GlobalExceptionHandler` only knows about `EmployeeNotFoundException` and `MethodArgumentNotValidException`. Anything else (unmapped routes, a future `NullPointerException`, a bug) skips our consistent `ErrorResponse` shape entirely and falls back to Spring's raw default handler.
+**Decisions baked into this plan:**
+- **Database: MySQL**, using your existing local install (no new install needed).
+- **No Flyway yet.** You'll add it later — for now Hibernate manages the schema directly (`ddl-auto=update`), which is fine for solo local development but is exactly what you'll want to replace with versioned migrations before this goes anywhere near prod. Flagged again in the Appendix so it isn't forgotten.
+- **DTOs separate from the JPA entity.** The entity (`Employee`) maps to the `employees` table; separate `EmployeeRequest`/`EmployeeResponse` classes define the API's wire format. This avoids ever serializing a JPA-managed object straight to JSON (which risks leaking lazy-loading proxies, or letting a client set fields like `id` it shouldn't control — the "mass assignment" problem, same reason you wouldn't `return prisma.employee` straight out of an Express handler if the DB row had internal-only fields).
+- **Credentials via environment variables, never in `application.properties`.** Real prod practice — secrets don't belong in a file that gets committed to git.
 
-**Goal:** nothing unexpected should ever return a raw stack trace to the client. Every response — expected error, unexpected bug, or unmapped route — should come back in the same `ErrorResponse` shape, while the *real* error detail is logged server-side where you can still debug it.
+While rewriting the service/controller layer, this plan also fixes three things flagged earlier in `CLAUDE.md`:
+- `DELETE /employeee/{id}` → `DELETE /employees/{id}` (typo)
+- `updateEmployee` now updates `salary` too, not just `name`/`department`
+- `PUT /employees/{id}` on a missing id now returns `404` (via the existing `EmployeeNotFoundException`) instead of `null`
 
-**Main tradeoff to keep in mind:** hiding details from the client makes debugging harder unless paired with real server-side logging. That's exactly what step 2 below adds — you're not losing the information, you're just moving it from "sent to attacker" to "written to your logs."
+It also fixes a real bug you'd hit the moment DTO validation runs: `Employee.salary` is `BigDecimal` but annotated `@NotBlank`, which only supports `CharSequence` — Hibernate Validator throws `ConstraintDeclarationException` at validation time, not a clean 400. The new `EmployeeRequest` DTO uses `@NotNull @Positive` instead.
+
+Work through the steps in order — each one leaves the app in a compilable (though not yet fully working) state until Step 9, where the controller is wired back up.
 
 ---
 
-## Step 1 — Stop leaking stack traces via Spring's default handler
+## Step 1 — Create the app database and user in your existing MySQL
+
+Open a terminal with MySQL's client (`mysql -u root -p`, or use MySQL Workbench's Query tab if you prefer a GUI) connected as `root` (or whichever admin account you set up during install). Create a dedicated app database, a dedicated app user (never run the app as `root`), and a separate database for tests:
+
+```sql
+CREATE DATABASE employeedb CHARACTER SET utf8mb4;
+CREATE DATABASE employeedb_test CHARACTER SET utf8mb4;
+
+CREATE USER 'employee_app'@'localhost' IDENTIFIED BY 'choose-a-strong-password';
+
+GRANT ALL PRIVILEGES ON employeedb.* TO 'employee_app'@'localhost';
+GRANT ALL PRIVILEGES ON employeedb_test.* TO 'employee_app'@'localhost';
+FLUSH PRIVILEGES;
+```
+
+Verify the new user can connect:
+
+```
+mysql -u employee_app -p employeedb
+```
+
+It should prompt for the password you set and drop you into a `mysql>` prompt against the `employeedb` schema.
+
+**Why a separate user instead of `root`:** least privilege — the app user can only touch its own two databases, so a bug or injection in the app can't reach other databases on the same server. Why a separate `employeedb_test` database: so automated tests (Step 11) never read/write your real dev data.
+
+---
+
+## Step 2 — Add dependencies
+
+File: `pom.xml`
+
+Add inside `<dependencies>`:
+
+```xml
+<dependency>
+    <groupId>org.springframework.boot</groupId>
+    <artifactId>spring-boot-starter-data-jpa</artifactId>
+</dependency>
+
+<dependency>
+    <groupId>com.mysql</groupId>
+    <artifactId>mysql-connector-j</artifactId>
+    <scope>runtime</scope>
+</dependency>
+```
+
+`mysql-connector-j` is the current artifact name for MySQL's JDBC driver (the older `mysql-connector-java` name is deprecated as of Connector/J 8.1+). `spring-boot-starter-data-jpa` is the Spring Data JPA starter — the Spring equivalent of installing an ORM (TypeORM/Prisma) plus its query-builder layer in one package. It pulls in Hibernate as the JPA implementation.
+
+No Flyway dependency for now, per your call — see the Context section and Appendix.
+
+---
+
+## Step 3 — Configure the database connection
 
 File: `src/main/resources/application.properties`
 
 Add:
+
 ```properties
-server.error.include-stacktrace=never
-server.error.include-message=never
-server.error.include-binding-errors=never
+spring.datasource.url=jdbc:mysql://localhost:3306/employeedb
+spring.datasource.username=${DB_USERNAME:employee_app}
+spring.datasource.password=${DB_PASSWORD}
+spring.datasource.driver-class-name=com.mysql.cj.jdbc.Driver
+
+spring.jpa.hibernate.ddl-auto=update
+spring.jpa.open-in-view=false
 ```
 
-Full file after the change:
-```properties
-spring.application.name=demo
-server.port=8080
+Why each line matters:
+- **`${DB_USERNAME:employee_app}` / `${DB_PASSWORD}`** — Spring property placeholders that read from environment variables, with `employee_app` as a fallback default for the username only. There's deliberately no fallback for the password — if `DB_PASSWORD` isn't set, startup fails loudly instead of silently trying a blank/wrong password. Before running the app, set it in PowerShell:
 
-server.error.include-stacktrace=never
-server.error.include-message=never
-server.error.include-binding-errors=never
-```
+  ```powershell
+  $env:DB_PASSWORD = "the-password-you-set-in-step-1"
+  ```
 
-Why: this is Spring Boot's own built-in default `/error` handler (`BasicErrorController`) — the thing that produced the `timestamp`/`status`/`error`/`trace`/`message`/`path` JSON you saw. These properties tell it to never include the stack trace, the raw exception message, or field-binding errors in its response, regardless of what triggers it. This is a safety net that protects you even for exceptions your own code hasn't thought to handle yet — defense in depth, on top of step 2.
+  (That only lasts for the current terminal session — set it again each time you open a new one, or use `setx DB_PASSWORD "..."` once for a durable machine-level variable. Either way, this password never goes in a file that gets committed.)
+
+- **`ddl-auto=update`** — tells Hibernate to create/alter the `employees` table itself based on the `@Entity` mapping (Step 4), so there's no separate schema file to write right now. This is fine for solo local dev, but it's the thing you'll swap for `ddl-auto=validate` + a Flyway migration once you add Flyway back (see Appendix) — `update` can do surprising, silently-lossy things to a schema (e.g. it won't shrink a column or drop a removed one), which is exactly why teams don't run it against real data.
+- **`open-in-view=false`** — Spring Boot's default (`true`) keeps a DB connection/session open for the entire HTTP request, including view rendering. It's a well-known anti-pattern (it hides lazy-loading bugs and N+1 queries until they show up in prod under load). Turning it off now, while the app is simple, means you'll get loud, early errors if you ever access lazy data outside a transaction — much easier to fix with 3 entities than 30.
+
+Hibernate 6 auto-detects the MySQL dialect from the JDBC URL, so no explicit `hibernate.dialect` property is needed.
+
+If your MySQL install doesn't use SSL and you see a connection warning/error about SSL, you can add `&useSSL=false` to the URL for local dev — not something to carry into a real prod setup, just a common local-MySQL wrinkle.
 
 ---
 
-## Step 2 — Add a catch-all handler to `GlobalExceptionHandler`
+## Step 4 — Turn `Employee` into a JPA entity
 
-File: `src/main/java/com/crud/demo/exception/GlobalExceptionHandler.java`
-
-Two more `@ExceptionHandler` methods, so *every* exception type ends up producing your consistent `ErrorResponse` JSON instead of falling through to Spring's default page:
-
-1. **`NoResourceFoundException`** — handles the "unmapped URL" case specifically (like `/employeesd`), returning the semantically correct `404` (a typo'd/unknown route is a client error, not a server error).
-2. **`Exception`** (catch-all) — handles anything truly unanticipated, logs the *real* exception server-side with its full stack trace, and returns the client a generic `500` with no internal detail.
+Move the file to a new `entity` package (parallel to `model` — makes the "this maps to a DB table" role explicit): `src/main/java/com/crud/demo/entity/Employee.java`
 
 ```java
-package com.crud.demo.exception;
+package com.crud.demo.entity;
 
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
-import org.springframework.http.HttpStatus;
-import org.springframework.http.ResponseEntity;
-import org.springframework.validation.FieldError;
-import org.springframework.web.bind.MethodArgumentNotValidException;
-import org.springframework.web.bind.annotation.ExceptionHandler;
-import org.springframework.web.bind.annotation.RestControllerAdvice;
-import org.springframework.web.servlet.resource.NoResourceFoundException;
+import jakarta.persistence.Column;
+import jakarta.persistence.Entity;
+import jakarta.persistence.GeneratedValue;
+import jakarta.persistence.GenerationType;
+import jakarta.persistence.Id;
+import jakarta.persistence.Table;
 
-import java.util.HashMap;
-import java.util.Map;
+import java.math.BigDecimal;
 
-@RestControllerAdvice
-public class GlobalExceptionHandler {
+@Entity
+@Table(name = "employees")
+public class Employee {
 
-    private static final Logger log = LoggerFactory.getLogger(GlobalExceptionHandler.class);
+    @Id
+    @GeneratedValue(strategy = GenerationType.IDENTITY)
+    private Long id;
 
-    @ExceptionHandler(EmployeeNotFoundException.class)
-    public ResponseEntity<ErrorResponse> handleNotFound(EmployeeNotFoundException ex) {
-        return ResponseEntity
-            .status(HttpStatus.NOT_FOUND)
-            .body(new ErrorResponse(HttpStatus.NOT_FOUND.value(), ex.getMessage()));
+    @Column(nullable = false)
+    private String name;
+
+    @Column(nullable = false)
+    private String department;
+
+    @Column(nullable = false, precision = 12, scale = 2)
+    private BigDecimal salary;
+
+    public Employee() {
+        // required by JPA
     }
 
-    @ExceptionHandler(MethodArgumentNotValidException.class)
-    public ResponseEntity<ErrorResponse> handleValidation(MethodArgumentNotValidException ex) {
-        Map<String, String> fieldErrors = new HashMap<>();
-        for (FieldError error : ex.getBindingResult().getFieldErrors()) {
-            fieldErrors.put(error.getField(), error.getDefaultMessage());
-        }
-        return ResponseEntity
-            .status(HttpStatus.BAD_REQUEST)
-            .body(new ErrorResponse(HttpStatus.BAD_REQUEST.value(), "Validation failed", fieldErrors));
+    public Employee(Long id, String name, String department, BigDecimal salary) {
+        this.id = id;
+        this.name = name;
+        this.department = department;
+        this.salary = salary;
     }
 
-    @ExceptionHandler(NoResourceFoundException.class)
-    public ResponseEntity<ErrorResponse> handleNoResource(NoResourceFoundException ex) {
-        return ResponseEntity
-            .status(HttpStatus.NOT_FOUND)
-            .body(new ErrorResponse(HttpStatus.NOT_FOUND.value(), "No such route: " + ex.getResourcePath()));
+    public Long getId() {
+        return id;
     }
 
-    @ExceptionHandler(Exception.class)
-    public ResponseEntity<ErrorResponse> handleUnexpected(Exception ex) {
-        log.error("Unexpected error", ex);
-        return ResponseEntity
-            .status(HttpStatus.INTERNAL_SERVER_ERROR)
-            .body(new ErrorResponse(HttpStatus.INTERNAL_SERVER_ERROR.value(), "Something went wrong"));
+    public void setId(Long id) {
+        this.id = id;
+    }
+
+    public String getName() {
+        return name;
+    }
+
+    public void setName(String name) {
+        this.name = name;
+    }
+
+    public String getDepartment() {
+        return department;
+    }
+
+    public void setDepartment(String department) {
+        this.department = department;
+    }
+
+    public BigDecimal getSalary() {
+        return salary;
+    }
+
+    public void setSalary(BigDecimal salary) {
+        this.salary = salary;
     }
 }
 ```
 
 Notes:
-- **Ordering doesn't matter.** Spring always picks the *most specific* matching `@ExceptionHandler` for a thrown exception, so `EmployeeNotFoundException` will still hit `handleNotFound`, not the generic `handleUnexpected`, even though `Exception` is a superclass of everything. You don't need to worry about method order in the file.
-- **Why log only in the catch-all, not the others:** `EmployeeNotFoundException` and validation failures are *expected*, routine client errors (wrong id, bad input) — logging every one of those at `ERROR` level would flood your logs with noise. The catch-all is specifically for the "this should never happen" case, which is exactly when you want a loud server-side log with the full stack trace (`log.error("...", ex)` includes it automatically).
-- `log` uses SLF4J (`org.slf4j`), the standard logging facade Spring Boot wires up by default — you don't need to add any dependency for this.
+- All the `jakarta.validation` annotations (`@NotBlank`, `@Positive`) are **gone** from this class. Validation now lives entirely on the `EmployeeRequest` DTO (Step 5) — the entity's job is just "this is what a row looks like," not "this is what a valid API request looks like." Those are different concerns even when the fields happen to match today.
+- `@GeneratedValue(strategy = GenerationType.IDENTITY)` — the database (MySQL's `AUTO_INCREMENT` column, which Hibernate creates for you from this annotation since `ddl-auto=update`) assigns the id, not your Java code. That's why `id` had to stop being `@Positive`-validated on input: for creates, the client never sends an id at all now. `IDENTITY` is the natural, idiomatic fit for MySQL specifically (it maps directly to `AUTO_INCREMENT`).
+- Delete the old `src/main/java/com/crud/demo/model/Employee.java` once this compiles — don't leave two copies around.
+- `model/Positive.java` (the unused empty custom annotation) can be deleted too while you're in here; it was never wired up and nothing in this plan uses it.
 
 ---
 
-## Step 3 — Verify
+## Step 5 — Create request/response DTOs
 
-1. `.\mvnw.cmd -q compile`
-2. `.\mvnw.cmd spring-boot:run`
-3. Exercise these cases:
+New package: `src/main/java/com/crud/demo/dto/`
 
-   | Request | Before | After (expected) |
-   |---|---|---|
-   | `GET /employeesd` (typo route) | `404` with full stack `trace` field | `404` — `{"status":404,"message":"No such route: employeesd"}`, no trace |
-   | `GET /employees/999` | `404`, clean body (already working) | unchanged |
-   | `POST /employees` with a body that still trips the `salary`/`@NotBlank` bug | `500` with stack trace | `500` — `{"status":500,"message":"Something went wrong"}`, no trace. Check the app console: you should see the full `UnexpectedTypeException` logged there via `log.error`, proving the real detail wasn't lost, just moved server-side. |
-   | `GET /employees/1` | `200`, employee JSON | unchanged |
+`EmployeeRequest.java` — shape of the JSON body for `POST`/`PUT`:
 
-If all four match, the app now has a single, consistent, safe error contract for every failure mode.
+```java
+package com.crud.demo.dto;
+
+import jakarta.validation.constraints.NotBlank;
+import jakarta.validation.constraints.NotNull;
+import jakarta.validation.constraints.Positive;
+
+import java.math.BigDecimal;
+
+public class EmployeeRequest {
+
+    @NotBlank(message = "Name is required")
+    private String name;
+
+    @NotBlank(message = "Department is required")
+    private String department;
+
+    @NotNull(message = "Salary is required")
+    @Positive(message = "Salary must be greater than 0")
+    private BigDecimal salary;
+
+    public String getName() {
+        return name;
+    }
+
+    public void setName(String name) {
+        this.name = name;
+    }
+
+    public String getDepartment() {
+        return department;
+    }
+
+    public void setDepartment(String department) {
+        this.department = department;
+    }
+
+    public BigDecimal getSalary() {
+        return salary;
+    }
+
+    public void setSalary(BigDecimal salary) {
+        this.salary = salary;
+    }
+}
+```
+
+`EmployeeResponse.java` — shape of the JSON returned to clients:
+
+```java
+package com.crud.demo.dto;
+
+import com.crud.demo.entity.Employee;
+
+import java.math.BigDecimal;
+
+public class EmployeeResponse {
+
+    private final Long id;
+    private final String name;
+    private final String department;
+    private final BigDecimal salary;
+
+    public EmployeeResponse(Long id, String name, String department, BigDecimal salary) {
+        this.id = id;
+        this.name = name;
+        this.department = department;
+        this.salary = salary;
+    }
+
+    public static EmployeeResponse from(Employee employee) {
+        return new EmployeeResponse(
+            employee.getId(),
+            employee.getName(),
+            employee.getDepartment(),
+            employee.getSalary()
+        );
+    }
+
+    public Long getId() {
+        return id;
+    }
+
+    public String getName() {
+        return name;
+    }
+
+    public String getDepartment() {
+        return department;
+    }
+
+    public BigDecimal getSalary() {
+        return salary;
+    }
+}
+```
+
+Right now `EmployeeRequest`/`EmployeeResponse`/`Employee` have identical fields, so this can feel like pointless duplication — the payoff shows up the moment they diverge (e.g., you add a `createdAt` column you don't want clients setting, or a computed field on the response that isn't a DB column). Once you have more than a couple of DTOs, look at **MapStruct** to generate this mapping code instead of hand-writing `from()` methods — not needed yet with one entity.
+
+---
+
+## Step 6 — Create the repository interface
+
+New file: `src/main/java/com/crud/demo/repository/EmployeeRepository.java`
+
+```java
+package com.crud.demo.repository;
+
+import com.crud.demo.entity.Employee;
+import org.springframework.data.jpa.repository.JpaRepository;
+
+import java.util.List;
+
+public interface EmployeeRepository extends JpaRepository<Employee, Long> {
+
+    List<Employee> findByDepartmentIgnoreCase(String department);
+}
+```
+
+That's the entire repository. `JpaRepository<Employee, Long>` already gives you `findAll()`, `findById()`, `save()`, `deleteById()`, `existsById()`, etc. `findByDepartmentIgnoreCase` is a **derived query method** — Spring Data parses the method name and generates the SQL for you; no implementation needed. This replaces the manual `for` loop in `searchEmployees`. (Analogy: like a Prisma `findMany({ where: { department: { equals: x, mode: 'insensitive' } } })`, but the "query" is the method signature itself.)
+
+Note: MySQL's default collation for `VARCHAR` columns (`utf8mb4_0900_ai_ci` on MySQL 8) is already case-insensitive, so `findByDepartmentIgnoreCase` and a plain `findByDepartment` would behave the same here in practice — but keep the explicit `IgnoreCase` anyway. It documents the intent and won't break if the column's collation ever changes to a case-sensitive one.
+
+---
+
+## Step 7 — Seed the initial data on startup
+
+Without Flyway, there's no migration file to put seed `INSERT`s in — so instead, port the two seed employees from `EmployeeService`'s old constructor into a small startup hook that inserts them (once) via the repository.
+
+New file: `src/main/java/com/crud/demo/config/DataSeeder.java`
+
+```java
+package com.crud.demo.config;
+
+import com.crud.demo.entity.Employee;
+import com.crud.demo.repository.EmployeeRepository;
+import org.springframework.boot.CommandLineRunner;
+import org.springframework.stereotype.Component;
+
+import java.math.BigDecimal;
+
+@Component
+public class DataSeeder implements CommandLineRunner {
+
+    private final EmployeeRepository employeeRepository;
+
+    public DataSeeder(EmployeeRepository employeeRepository) {
+        this.employeeRepository = employeeRepository;
+    }
+
+    @Override
+    public void run(String... args) {
+        if (employeeRepository.count() == 0) {
+            employeeRepository.save(new Employee(null, "Naveen", "Developer", new BigDecimal("12")));
+            employeeRepository.save(new Employee(null, "Naveen2", "Developer", new BigDecimal("24")));
+        }
+    }
+}
+```
+
+`CommandLineRunner` is a Spring Boot interface for "run this once, right after the application context finishes starting up" — any bean implementing it gets its `run()` method called automatically (analogous to a one-off startup script in a Node app, e.g. something you'd run in an `index.js` before `app.listen()`). The `count() == 0` guard is what makes this safe to run on every restart: it only seeds on a genuinely empty table, so it won't duplicate rows every time you restart the app against the same database.
+
+This is a deliberately simple stand-in for what a Flyway `V2__seed_employees.sql` migration will do later — see the Appendix for that swap.
+
+**Do the same for `employeedb_test`** implicitly: since `ddl-auto=update` (Step 3/Step 11) creates the schema automatically the first time each database is connected to, no manual setup is needed there beyond having created the database in Step 1. The `DataSeeder` only runs for the full application context, though — the `@DataJpaTest` in Step 11 doesn't load it, so that test seeds its own row directly.
+
+---
+
+## Step 8 — Rewrite `EmployeeService` to use the repository
+
+File: `src/main/java/com/crud/demo/service/EmployeeService.java`
+
+```java
+package com.crud.demo.service;
+
+import com.crud.demo.entity.Employee;
+import com.crud.demo.exception.EmployeeNotFoundException;
+import com.crud.demo.repository.EmployeeRepository;
+import org.springframework.stereotype.Service;
+
+import java.util.List;
+
+@Service
+public class EmployeeService {
+
+    private final EmployeeRepository employeeRepository;
+
+    public EmployeeService(EmployeeRepository employeeRepository) {
+        this.employeeRepository = employeeRepository;
+    }
+
+    public List<Employee> getAllEmployees() {
+        return employeeRepository.findAll();
+    }
+
+    public Employee getEmployee(Long id) {
+        return employeeRepository.findById(id)
+            .orElseThrow(() -> new EmployeeNotFoundException("Employee not found with id: " + id));
+    }
+
+    public Employee addEmployee(Employee employee) {
+        return employeeRepository.save(employee);
+    }
+
+    public Employee updateEmployee(Employee updatedEmployee, Long id) {
+        Employee existing = getEmployee(id);
+        existing.setName(updatedEmployee.getName());
+        existing.setDepartment(updatedEmployee.getDepartment());
+        existing.setSalary(updatedEmployee.getSalary());
+        return employeeRepository.save(existing);
+    }
+
+    public void deleteEmployee(Long id) {
+        if (!employeeRepository.existsById(id)) {
+            throw new EmployeeNotFoundException("Employee not found with id: " + id);
+        }
+        employeeRepository.deleteById(id);
+    }
+
+    public List<Employee> searchEmployees(String department) {
+        return employeeRepository.findByDepartmentIgnoreCase(department);
+    }
+}
+```
+
+What changed and why:
+- `addEmployee` now returns the single created `Employee`, not the whole list — returning the entire collection from a create operation was already an unusual REST choice; now that the controller (Step 9) returns `201 Created` with a `Location` header, returning just the created resource is the conventional shape.
+- `updateEmployee` now updates `salary` too (previously silently dropped), and reuses `getEmployee` so a missing id throws the same `EmployeeNotFoundException` as everywhere else — the controller no longer needs special-case `null`-checking.
+- `deleteEmployee` now throws on a missing id instead of silently returning `false`, so a `DELETE` on a nonexistent employee returns a proper `404` via `GlobalExceptionHandler` instead of a bare `200`/`false`.
+
+---
+
+## Step 9 — Update the controller to use DTOs and fix routes/status codes
+
+File: `src/main/java/com/crud/demo/controller/EmployeeController.java`
+
+```java
+package com.crud.demo.controller;
+
+import com.crud.demo.dto.EmployeeRequest;
+import com.crud.demo.dto.EmployeeResponse;
+import com.crud.demo.entity.Employee;
+import com.crud.demo.service.EmployeeService;
+import jakarta.validation.Valid;
+import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.*;
+
+import java.net.URI;
+import java.util.List;
+import java.util.stream.Collectors;
+
+@RestController
+@RequestMapping("/employees")
+public class EmployeeController {
+
+    private final EmployeeService employeeService;
+
+    public EmployeeController(EmployeeService employeeService) {
+        this.employeeService = employeeService;
+    }
+
+    @GetMapping
+    public List<EmployeeResponse> getAllEmployees() {
+        return employeeService.getAllEmployees().stream()
+            .map(EmployeeResponse::from)
+            .collect(Collectors.toList());
+    }
+
+    @GetMapping("/{id}")
+    public EmployeeResponse getEmployee(@PathVariable Long id) {
+        return EmployeeResponse.from(employeeService.getEmployee(id));
+    }
+
+    @PostMapping
+    public ResponseEntity<EmployeeResponse> postEmployee(@Valid @RequestBody EmployeeRequest request) {
+        Employee saved = employeeService.addEmployee(toEntity(request));
+        return ResponseEntity
+            .created(URI.create("/employees/" + saved.getId()))
+            .body(EmployeeResponse.from(saved));
+    }
+
+    @PutMapping("/{id}")
+    public EmployeeResponse updateEmployee(@Valid @RequestBody EmployeeRequest request, @PathVariable Long id) {
+        Employee updated = employeeService.updateEmployee(toEntity(request), id);
+        return EmployeeResponse.from(updated);
+    }
+
+    @DeleteMapping("/{id}")
+    public ResponseEntity<Void> deleteEmployee(@PathVariable Long id) {
+        employeeService.deleteEmployee(id);
+        return ResponseEntity.noContent().build();
+    }
+
+    @GetMapping("/search")
+    public List<EmployeeResponse> searchEmployees(@RequestParam String department) {
+        return employeeService.searchEmployees(department).stream()
+            .map(EmployeeResponse::from)
+            .collect(Collectors.toList());
+    }
+
+    private Employee toEntity(EmployeeRequest request) {
+        Employee employee = new Employee();
+        employee.setName(request.getName());
+        employee.setDepartment(request.getDepartment());
+        employee.setSalary(request.getSalary());
+        return employee;
+    }
+}
+```
+
+Changes from the old controller:
+- `@RequestMapping("/employees")` moved to the class, and every method path is now relative (`""`, `"/{id}"`, `"/search"`). This is what fixes the `/employeee/{id}` (three-e) typo on delete — there's now one base path for the whole resource, so a typo like that can't happen per-method.
+- `POST` returns `201 Created` with a `Location` header pointing at the new resource, via `ResponseEntity.created(...)` — the standard REST convention for "here's the thing you just created and where to find it again," rather than `200` with the whole list.
+- `DELETE` returns `204 No Content` (nothing to return once it's gone) instead of a bare `boolean`.
+- `@Valid` now validates `EmployeeRequest`, which has real, applicable constraints (fixing the `@NotBlank` on `BigDecimal` bug from Step 4).
+
+---
+
+## Step 10 — (Recommended) Handle DB constraint violations centrally
+
+File: `src/main/java/com/crud/demo/exception/GlobalExceptionHandler.java`
+
+Now that a real database with `NOT NULL` constraints sits behind the API, add one more handler so a constraint violation (or any other JPA data-access failure) returns a clean `409 Conflict` instead of falling through to the generic `500` catch-all:
+
+```java
+import org.springframework.dao.DataIntegrityViolationException;
+```
+
+```java
+@ExceptionHandler(DataIntegrityViolationException.class)
+public ResponseEntity<ErrorResponse> handleDataIntegrityViolation(DataIntegrityViolationException ex) {
+    log.warn("Data integrity violation", ex);
+    return ResponseEntity
+        .status(HttpStatus.CONFLICT)
+        .body(new ErrorResponse(HttpStatus.CONFLICT.value(), "Request conflicts with existing data"));
+}
+```
+
+Add this method into the existing class alongside the other `@ExceptionHandler` methods — no other changes needed there. This handler is DB-agnostic (it's a Spring abstraction over the underlying JDBC exception), so it's identical whether the app runs on MySQL, Postgres, or anything else.
+
+---
+
+## Step 11 — Point tests at the test database, and add a repository test
+
+New file: `src/test/resources/application.properties` — this fully overrides the main `application.properties` for anything run under Maven's test classpath (test resources take precedence over main resources), so tests never touch your dev data:
+
+```properties
+spring.datasource.url=jdbc:mysql://localhost:3306/employeedb_test
+spring.datasource.username=${DB_USERNAME:employee_app}
+spring.datasource.password=${DB_PASSWORD}
+spring.datasource.driver-class-name=com.mysql.cj.jdbc.Driver
+
+spring.jpa.hibernate.ddl-auto=update
+```
+
+New file: `src/test/java/com/crud/demo/repository/EmployeeRepositoryTest.java`
+
+```java
+package com.crud.demo.repository;
+
+import com.crud.demo.entity.Employee;
+import org.junit.jupiter.api.Test;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.boot.test.autoconfigure.orm.jpa.DataJpaTest;
+
+import java.math.BigDecimal;
+import java.util.List;
+
+import static org.assertj.core.api.Assertions.assertThat;
+
+@DataJpaTest
+class EmployeeRepositoryTest {
+
+    @Autowired
+    private EmployeeRepository employeeRepository;
+
+    @Test
+    void findByDepartmentIgnoreCase_matchesRegardlessOfCase() {
+        employeeRepository.save(new Employee(null, "Alice", "Engineering", new BigDecimal("100.00")));
+
+        List<Employee> results = employeeRepository.findByDepartmentIgnoreCase("engineering");
+
+        assertThat(results).hasSize(1);
+        assertThat(results.get(0).getName()).isEqualTo("Alice");
+    }
+}
+```
+
+Important tradeoff to understand here: without Docker, **Testcontainers** (the gold-standard approach — spins up a disposable real MySQL in a container per test run) isn't an option. Instead, `@DataJpaTest` runs against your real, persistent `employeedb_test` database, but each test method is wrapped in a transaction that's rolled back automatically at the end — so `Alice` above never actually stays committed. This is a reasonable pragmatic setup without Docker, but it's not perfectly isolated (tests share one long-lived database and can't run safely in parallel against it). If Docker ever becomes available to you, migrating this to Testcontainers is a clean upgrade with no changes to the entity/repository/service code.
+
+You need `$env:DB_PASSWORD` set in the terminal before running tests too, same as running the app.
+
+The existing `DemoApplicationTests#contextLoads` needs no changes — it'll now also implicitly verify the datasource and Hibernate mapping wire up correctly at startup.
+
+---
+
+## Step 12 — Verify
+
+1. Make sure MySQL is running (check via `services.msc` or `Get-Service MySQL*` if it's installed as a Windows service) and `$env:DB_PASSWORD` is set in your terminal.
+2. `.\mvnw.cmd -q compile` — fix any leftover references to the deleted `model.Employee`/`model.Positive`.
+3. `.\mvnw.cmd spring-boot:run` — watch the startup log for Hibernate creating the `employees` table (visible if you enable `spring.jpa.show-sql=true` temporarily) and no errors.
+4. Open MySQL Workbench (or `mysql -u employee_app -p employeedb`) and confirm the `employees` table has the two seeded rows: `SELECT * FROM employees;`
+5. Exercise the endpoints:
+
+   | Request | Expected |
+   |---|---|
+   | `GET /employees` | `200`, the two seeded employees, each with an `id` |
+   | `POST /employees` `{"name":"Sam","department":"QA","salary":50000}` | `201`, `Location: /employees/3`, body has the new employee with generated id |
+   | `PUT /employees/1` `{"name":"Naveen","department":"Developer","salary":99}` | `200`, salary is now `99` (previously silently ignored) |
+   | `PUT /employees/999` | `404` via `EmployeeNotFoundException` (previously returned `null`/`200`) |
+   | `DELETE /employees/1` | `204`, then `GET /employees/1` → `404` |
+   | `DELETE /employees/999` | `404` (previously returned `false`/`200`) |
+   | Restart the app (`Ctrl+C`, run again) | Remaining employees are still there — this is the actual "in-memory → persistent" win |
+6. `.\mvnw.cmd test` — `EmployeeRepositoryTest` and `DemoApplicationTests` should both pass against `employeedb_test`.
+
+---
+
+## Appendix — Later upgrades, once you're ready for them
+
+These are explicitly **out of scope** for this step (you said this comes later as you grow toward "prod-grade"), but worth knowing they're there:
+
+- **Flyway.** When you're ready: add `flyway-core` + `flyway-mysql` back to `pom.xml`, generate a `V1__create_employees_table.sql` from whatever the current live schema actually is (e.g. via `SHOW CREATE TABLE employees;` in MySQL, cleaned up), drop it in `src/main/resources/db/migration/`, flip `spring.jpa.hibernate.ddl-auto` from `update` to `validate`, and delete `DataSeeder` in favor of a `V2__seed_employees.sql`. Do this on a fresh/disposable database first to confirm the migration reproduces the schema Hibernate had been silently maintaining — that's the moment `update`'s schema drift (if any crept in) would surface.
+- **Docker + Testcontainers** for tests, once Docker is available — replaces the "real DB, rolled-back transaction" test setup in Step 11 with fully isolated, disposable MySQL instances per test run.
+- **Profile-specific config** (`application-dev.properties` / `application-prod.properties`) once you have more than one real environment to configure differently.
+- **A managed cloud database** (RDS, Cloud SQL, PlanetScale, etc.) in real prod — at that point it's just another URL + credentials swap, same as this whole migration was designed to make painless. Nothing in the entity, repository, service, or controller changes — that's true whether you stay on MySQL or later move to Postgres or anything else.
+- **A secrets manager** (instead of a plain environment variable) once this runs somewhere other than your own machine.
